@@ -1,17 +1,25 @@
 FROM python:3.11-slim
 
-# Install GLPK solver
-RUN apt-get update && apt-get install -y glpk-utils
+# Install system dependencies + GLPK solver
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    glpk-utils \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy dependencies
+# Copy dependency file
 COPY requirements.txt .
+
+# Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend code
 COPY . .
 
-# Run FastAPI server
-CMD ["uvicorn", "backend:app", "--host", "0.0.0.0", "--port", "10000"]
+# Railway provides $PORT environment var
+ENV PORT=8000
+
+# Start FastAPI server
+CMD ["sh", "-c", "uvicorn backend:app --host 0.0.0.0 --port $PORT"]
