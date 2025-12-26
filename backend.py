@@ -7,7 +7,6 @@ from pyomo.opt import TerminationCondition
 
 app = FastAPI()
 
-# Allow frontend calls (Vercel / Local / Railway)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,40 +14,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # --------------------------------------------------
-# STORAGE — EMPLOYEE WORKLOAD DATA
+# STORAGE — filled by /upload_sheet from frontend
 # --------------------------------------------------
 
-# Each upload_sheet() call stores one employee entry
-EMPLOYEES = []
-
-# Derived function-wise workload aggregation
-FUNCTIONS = {}
-
+EMPLOYEES = []          # individual employee records
+FUNCTIONS = {}          # workload aggregation
+CURRENT_HC = {}         # function-role headcount
 
 
 # --------------------------------------------------
-# MODELS / SCHEMAS
+# FRONTEND MODELS
 # --------------------------------------------------
 
 class EmployeeSheet(BaseModel):
-    name: str = ""
-    code: str = ""
+    name: str | None = ""
+    code: str | None = ""
     func: str
     min: float
     max: float
     avg: float
+    role: str | None = "Executive"   # designation → mapped in frontend
 
 
 class OptimizeRequest(BaseModel):
-    N_current: Dict[str, int]
-
+    N_current: Dict[str, int]    # comes directly from Excel (auto HC)
 
 
 # --------------------------------------------------
-# API — Upload Parsed Employee Sheet
-# Called by frontend after Excel processing
+# API — store uploaded employee sheet
 # --------------------------------------------------
 
 @app.post("/upload_sheet")
@@ -56,69 +50,90 @@ def upload_sheet(emp: EmployeeSheet):
 
     EMPLOYEES.append(emp.dict())
 
-    func = emp.func.strip()
+    f = emp.func.strip()
 
-    if func not in FUNCTIONS:
-        FUNCTIONS[func] = {
-            "employees": 0,
-            "min": 0.0,
-            "max": 0.0,
-            "avg": 0.0
-        }
+    # ----------- workload aggregation ----------
+    if f not in FUNCTIONS:
+        FUNCTIONS[f] = dict(employees=0, min=0.0, max=0.0, avg=0.0)
 
-    FUNCTIONS[func]["employees"] += 1
-    FUNCTIONS[func]["min"] += emp.min
-    FUNCTIONS[func]["max"] += emp.max
-    FUNCTIONS[func]["avg"] += emp.avg
+    FUNCTIONS[f]["employees"] += 1
+    FUNCTIONS[f]["min"] += emp.min
+    FUNCTIONS[f]["max"] += emp.max
+    FUNCTIONS[f]["avg"] += emp.avg
 
-    return {"status": "stored", "function": func}
-
+    return {"status": "stored", "function": f}
 
 
 # --------------------------------------------------
-# API — Return Function-wise Workload Summary
-# Used to populate workload summary table
+# API — workload summary (used by frontend)
 # --------------------------------------------------
 
 @app.get("/workload")
 def workload_summary():
     return {
         "employees": EMPLOYEES,
-        "functions": FUNCTIONS
+        "functions": FUNCTIONS,
+        "current_hc": CURRENT_HC
     }
 
 
-
 # --------------------------------------------------
-# INTERNAL — Build Optimization Payload
+# INTERNAL — Build model inputs (teacher framework)
 # --------------------------------------------------
 
-def build_optimizer_inputs():
+ROLES = ["Manager", "AsstManager", "Officer", "Executive"]
+
+# HQ productivity norm
+CAPACITY_HOURS = 6.5
+
+# mild hierarchy weights (teacher suggestion)
+ALPHA = {
+    "Manager": 0.10,
+    "AsstManager": 0.20,
+    "Officer": 0.0,
+    "Executive": 0.0,
+}
+
+# redeployment-friendly objective weights
+PENALTY_REMOVE = {
+    "Manager": 3.0,
+    "AsstManager": 2.0,
+    "Officer": 1.0,
+    "Executive": 1.0,
+}
+
+BIG_M = 10_000.0  # avoids infeasibility
+
+
+def build_model_inputs(N_current_req: Dict[str, int]):
 
     F = list(FUNCTIONS.keys())
 
-    # Workload = average hours/day (teacher rule)
+    # total workload = SUM of employee avg hours in function
     W = {f: FUNCTIONS[f]["avg"] for f in F}
 
-    # Default roles (UI & model aligned)
-    R = ["Manager", "AsstManager", "Officer", "Executive"]
+    # convert frontend HC dict → role matrix
+    def build_matrix():
+        out = {}
+        for f in F:
+            for r in ROLES:
+                key = f"{f}|{r}"
+                out[(f, r)] = int(N_current_req.get(key, 0))
+        return out
 
-    # Capacity (hrs/day per employee) — fixed assumption
-    C = 6.5
+    N_current = build_matrix()
 
-    return F, R, W, C
-
+    return F, ROLES, W, CAPACITY_HOURS, N_current
 
 
 # --------------------------------------------------
-# API — OPTIMIZATION ENGINE
-# Pyomo + GLPK
+# OPTIMIZATION ENGINE
 # --------------------------------------------------
 
 @app.post("/optimize")
 def optimize(req: OptimizeRequest):
 
-    F, R, W, C = build_optimizer_inputs()
+    F, R, W, C, N_current = build_model_inputs(req.N_current)
 
     m = ConcreteModel()
 
@@ -128,38 +143,44 @@ def optimize(req: OptimizeRequest):
     m.W = Param(m.F, initialize=W)
     m.C = Param(initialize=C)
 
-    # Current Headcount Matrix
     def _N_init(m, f, r):
-        return req.N_current.get(f"{f}|{r}", 0)
+        return N_current.get((f, r), 0)
 
     m.N = Param(m.F, m.R, initialize=_N_init)
 
-    # Decision Variables
+    m.alpha = Param(m.R, initialize=lambda m, r: ALPHA.get(r, 0.0))
+    m.pen = Param(m.R, initialize=lambda m, r: PENALTY_REMOVE.get(r, 1.0))
+
+    # decision variables
     m.x = Var(m.F, m.R, domain=NonNegativeIntegers)
+
+    # shortage slack (hours/day)
     m.short = Var(m.F, domain=NonNegativeReals)
 
-    # Total HC per function
     def total_hc(m, f):
         return sum(m.x[f, r] for r in m.R)
 
-    # Workload Satisfaction
+    # -------- Constraint 1: Workload Coverage --------
     def workload_rule(m, f):
         return total_hc(m, f) * m.C + m.short[f] >= m.W[f]
-
     m.workload = Constraint(m.F, rule=workload_rule)
 
-    # Upper bound — cannot exceed current staff
-    def upper_bound(m, f, r):
+    # -------- Constraint 2: Upper Bound (no expansion) --------
+    def upper_rule(m, f, r):
         return m.x[f, r] <= m.N[f, r]
+    m.upper = Constraint(m.F, m.R, rule=upper_rule)
 
-    m.upper = Constraint(m.F, m.R, rule=upper_bound)
+    # -------- Constraint 3: Mild hierarchy role share --------
+    def role_share(m, f, r):
+        if value(m.alpha[r]) <= 0:
+            return Constraint.Skip
+        return m.x[f, r] >= m.alpha[r] * total_hc(m, f)
+    m.role_share = Constraint(m.F, m.R, rule=role_share)
 
-    # Objective: minimize removals + heavy penalty on shortage
-    BIG_M = 10000
-
+    # -------- Objective: minimize redeployment --------
     def obj(m):
         removed = sum(
-            (m.N[f, r] - m.x[f, r])
+            m.pen[r] * (m.N[f, r] - m.x[f, r])
             for f in m.F for r in m.R
         )
         shortage = BIG_M * sum(m.short[f] for f in m.F)
@@ -167,7 +188,6 @@ def optimize(req: OptimizeRequest):
 
     m.obj = Objective(rule=obj, sense=minimize)
 
-    # Solve Model
     solver = SolverFactory("glpk")
     results = solver.solve(m)
 
@@ -177,8 +197,7 @@ def optimize(req: OptimizeRequest):
     ):
         return {"status": "error", "message": "Model infeasible"}
 
-
-    # Build Response Table
+    # -------- Build Output Table --------
     rows = []
 
     for f in m.F:
@@ -190,12 +209,19 @@ def optimize(req: OptimizeRequest):
             rows.append({
                 "Function": f,
                 "Role": r,
+
+                # current manpower → from Excel
                 "Current": int(value(m.N[f, r])),
+
+                # optimal manpower → solver result
                 "Optimal": int(value(m.x[f, r])),
+
+                # redeployable manpower
                 "Removed": int(value(m.N[f, r]) - value(m.x[f, r])),
+
                 "Workload": round(value(m.W[f]), 2),
                 "Capacity": round(capacity, 2),
-                "Shortage": round(value(m.short[f]), 2)
+                "Shortage": round(value(m.short[f]), 2),
             })
 
     return {"status": "ok", "rows": rows}
